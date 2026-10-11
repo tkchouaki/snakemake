@@ -130,6 +130,19 @@ class JobScheduler(JobSchedulerExecutorInterface):
         self._run_performed = None
         self._input_sizes = {}
 
+        # On remote (cluster) executors, defer checkpoint dependency updates until
+        # the scheduler loop has a chance to batch multiple job completions. This
+        # avoids the expensive DAG re-parse that would otherwise happen for every
+        # single finished checkpoint job, causing the scheduler to block while
+        # cluster resources sit idle.
+        # We flush deferred updates only when either:
+        #   (a) enough checkpoint jobs have accumulated (batch_threshold), or
+        #   (b) no checkpoint has completed for a full status-check cycle
+        #       (indicating no more checkpoint jobs are finishing right now).
+        self.defer_checkpoint_updates = not self.dryrun
+        self._pending_checkpoint_jobs = []
+        self._last_checkpoint_finish_time = None
+
         if workflow.remote_execution_settings.immediate_submit:
             self.submit_callback = self._proceed
             self.finish_callback = self._noop
@@ -485,10 +498,33 @@ class JobScheduler(JobSchedulerExecutorInterface):
                         )
                     self.progress()
 
-                await self.workflow.dag.finish(
-                    job,
-                    update_checkpoint_dependencies=self.update_checkpoint_dependencies,
-                )
+                # On cluster executors, defer checkpoint-dependent finish calls.
+                # We still call dag.finish() to update running/finished sets and
+                # mark dependent jobs as ready, but we skip the expensive
+                # update_checkpoint_dependencies() until the scheduler loop calls
+                # _flush_pending_checkpoint_updates().
+                if (
+                    self.defer_checkpoint_updates
+                    and job.is_checkpoint
+                ):
+                    self._pending_checkpoint_jobs.append(job)
+                    self._last_checkpoint_finish_time = time.time()
+                    await self.workflow.dag.finish(
+                        job,
+                        update_checkpoint_dependencies=False,
+                    )
+                else:
+                    await self.workflow.dag.finish(
+                        job,
+                        update_checkpoint_dependencies=self.update_checkpoint_dependencies,
+                    )
+
+            # Flush deferred checkpoint updates after all jobs in this batch
+            # have been finished. On cluster executors, this ensures all checkpoint
+            # jobs that completed in this scheduling cycle are processed together
+            # in a single DAG update, avoiding the N-separate-updates problem.
+            if self.defer_checkpoint_updates:
+                await self._flush_pending_checkpoint_updates()
 
         self.workflow.async_run(postprocess())
         self._tofinish.clear()
@@ -514,10 +550,35 @@ class JobScheduler(JobSchedulerExecutorInterface):
             executor = self._executor
         executor.run_jobs(jobs)
 
+    async def _update_checkpoint_dependencies(self):
+        """Flush deferred checkpoint updates (cluster executors only)."""
+        await self._flush_pending_checkpoint_updates()
+
     def get_executor(self, job):
         if job.is_local and self._local_executor is not None:
             return self._local_executor
         return self._executor
+
+    async def _flush_pending_checkpoint_updates(self):
+        """Flush deferred checkpoint updates on cluster executors.
+
+        On cluster executors, checkpoint job completions are deferred so that
+        multiple finished checkpoints can be processed in a single
+        ``update_checkpoint_dependencies()`` call. This method accumulates all
+        pending checkpoint jobs and triggers a single batched DAG update.
+        """
+        if not self.defer_checkpoint_updates or not self._pending_checkpoint_jobs:
+            return
+
+        pending = list(self._pending_checkpoint_jobs)
+        self._pending_checkpoint_jobs.clear()
+
+        # Only update for checkpoint jobs that are actually checkpoints
+        checkpoint_jobs = [j for j in pending if j.is_checkpoint]
+        if not checkpoint_jobs:
+            return
+
+        await self.workflow.dag.update_checkpoint_dependencies(checkpoint_jobs)
 
     def _noop(self, job):
         pass
