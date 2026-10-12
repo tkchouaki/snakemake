@@ -1333,12 +1333,26 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
             self.delete_job(job, recursive=False)  # delete job from tree
             raise MissingInputException(job, missing_input)
 
-    async def update_needrun(self, create_inventory=False):
-        """Update the information whether a job needs to be executed."""
+    async def update_needrun(self, create_inventory=False, affected_jobs=None):
+        """Update the information whether a job needs to be executed.
+
+        If *affected_jobs* is provided (a set of jobs), only these jobs and
+        their downstream dependents are re-evaluated, rather than the full DAG.
+        This avoids an O(N) scan when only a small subgraph changed (e.g. after
+        a checkpoint update).  When *affected_jobs* is ``None`` the full-DAG
+        scan is performed as before.
+        """
 
         if create_inventory and self.workflow.is_main_process:
-            # Concurrently collect mtimes of all existing files.
-            await self.workflow.iocache.mtime_inventory(self.jobs)
+            if affected_jobs is not None:
+                # Only collect inventory for affected jobs + downstream.
+                to_update = set(affected_jobs)
+                to_update.update(
+                    self.bfs(self.depending, *affected_jobs, stop=lambda j: False)
+                )
+                await self.workflow.iocache.mtime_inventory(to_update)
+            else:
+                await self.workflow.iocache.mtime_inventory(self.jobs)
 
         output_mintime = dict()
 
@@ -1524,6 +1538,18 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
             [job for job in level if not self.finished(job)]
             for level in self.toposorted()
         ]
+        if affected_jobs is not None:
+            # Restrict evaluation to the affected subgraph.
+            to_evaluate = set(affected_jobs)
+            to_evaluate.update(
+                self.bfs(self.depending, *affected_jobs, stop=lambda j: False)
+            )
+            candidates = [
+                level for level in candidates if set(level) & to_evaluate
+            ]
+        # _to_evaluate is not used beyond this point because
+        # candidates_set (derived from the already-filtered candidates)
+        # naturally restricts all downstream BFS.
 
         is_all_forced = all(
             is_forced(job)
@@ -2205,7 +2231,15 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
 
             job_queue = defaultdict(set)
             if candidate_job_queue:
-                await self.update_needrun()
+                # Incremental needrun: only re-evaluate the replaced jobs and
+                # their downstream dependents instead of the full DAG.
+                replaced_jobs = set(candidate_job_queue.keys())
+                for rjob in list(replaced_jobs):
+                    if rjob in self.depending:
+                        replaced_jobs.update(
+                            self.bfs(self.depending, rjob, stop=lambda j: False)
+                        )
+                await self.update_needrun(affected_jobs=replaced_jobs)
                 for job, posterior_checkpoint_deps in candidate_job_queue.items():
                     for checkpoint in posterior_checkpoint_deps:
                         # the second clause ensures that we only process checkpoints
