@@ -142,6 +142,7 @@ class JobScheduler(JobSchedulerExecutorInterface):
         self.defer_checkpoint_updates = not self.dryrun
         self._pending_checkpoint_jobs = []
         self._last_checkpoint_finish_time = None
+        self._checkpoint_update_deferred_since_submission = False
 
         if workflow.remote_execution_settings.immediate_submit:
             self.submit_callback = self._proceed
@@ -397,6 +398,12 @@ class JobScheduler(JobSchedulerExecutorInterface):
                                 )
                             )
                         self.run(runjobs)
+                    # Mark that a submission round has completed. The next time
+                    # _finish_jobs processes finished jobs, it will flush any
+                    # deferred checkpoint updates so that the DAG is consistent
+                    # for the next scheduling selection.  This must be after ALL
+                    # jobs (local and remote) in this round have been submitted.
+                    self._checkpoint_update_deferred_since_submission = True
 
                 if not self.dryrun:
                     if self._run_performed is None or self._run_performed:
@@ -519,12 +526,32 @@ class JobScheduler(JobSchedulerExecutorInterface):
                         update_checkpoint_dependencies=self.update_checkpoint_dependencies,
                     )
 
-            # Flush deferred checkpoint updates after all jobs in this batch
-            # have been finished. On cluster executors, this ensures all checkpoint
-            # jobs that completed in this scheduling cycle are processed together
-            # in a single DAG update, avoiding the N-separate-updates problem.
-            if self.defer_checkpoint_updates:
-                await self._flush_pending_checkpoint_updates()
+            # Flush deferred checkpoint updates only after a submission round
+            # has completed.  This ensures that when a batch of N jobs is
+            # selected and submitted, checkpoint-dependent DAG updates are
+            # deferred until after that batch's jobs have been submitted,
+            # preventing checkpoint processing from interrupting the batch
+            # submission flow (e.g. under --max-jobs-per-timespan rate limiting).
+            if self.defer_checkpoint_updates and self._pending_checkpoint_jobs:
+                if self._checkpoint_update_deferred_since_submission:
+                    await self._flush_pending_checkpoint_updates()
+                    self._checkpoint_update_deferred_since_submission = False
+                # Fallback: if no new submission has happened but pending
+                # checkpoint jobs are waiting, flush after the rate-limiter
+                # timespan to avoid indefinite delay.
+                elif (
+                    self.job_rate_limiter is not None
+                    and self._last_checkpoint_finish_time is not None
+                ):
+                    elapsed = time.time() - self._last_checkpoint_finish_time
+                    if elapsed >= 2 * self.job_rate_limiter.timespan:
+                        logger.debug(
+                            f"Flushing deferred checkpoint updates after "
+                            f"{elapsed:.1f}s without new submission."
+                        )
+                        await self._flush_pending_checkpoint_updates()
+                        # Do NOT reset _checkpoint_update_deferred_since_submission
+                        # here since it was already False (no submission occurred).
 
         self.workflow.async_run(postprocess())
         self._tofinish.clear()
